@@ -15,9 +15,9 @@ app = Flask(__name__)
 
 # List of public proxies (update with your own list)
 proxies = [
-    "http://proxy1.com:8080",
-    "http://proxy2.com:8080",
-    "http://proxy3.com:8080"
+    "http://202.83.102.83:8080",
+    "http://153.101.67.170:9002",
+    "http://141.11.40.11:80"
 ]
 
 # Setup logging
