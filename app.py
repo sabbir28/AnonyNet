@@ -55,16 +55,28 @@ def proxy():
         app.logger.info(f"Received {request.method} request for {request.url} using proxy {selected_proxy}")
 
         # Forward the request to the target server
-        if request.method == 'POST':
-            response = requests.post(request.url, data=request.form, proxies=proxies_dict)
-        else:
-            response = requests.get(request.url, params=request.args, proxies=proxies_dict)
+        try:
+            if request.method == 'POST':
+                response = requests.post(request.url, data=request.form, proxies=proxies_dict, timeout=10)
+            else:
+                response = requests.get(request.url, params=request.args, proxies=proxies_dict, timeout=10)
+            
+            # Log the response
+            app.logger.info(f"Response status code: {response.status_code}")
 
-        # Log the response
-        app.logger.info(f"Response status code: {response.status_code}")
+            # Return the response from the target server
+            return Response(response.content, status=response.status_code, headers=dict(response.headers))
+        
+        except requests.exceptions.Timeout:
+            app.logger.error("Request timed out")
+            return Response("The request timed out. Please try again later.", status=504)
+        except requests.exceptions.ConnectionError:
+            app.logger.error("Connection error occurred")
+            return Response("A connection error occurred. Please try again later.", status=502)
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"An error occurred: {e}")
+            return Response("An error occurred while processing your request.", status=500)
 
-        # Return the response from the target server
-        return Response(response.content, status=response.status_code, headers=dict(response.headers))
     except Exception as e:
         app.logger.error(f"Error processing request: {e}")
         return Response("An error occurred while processing your request.", status=500)
