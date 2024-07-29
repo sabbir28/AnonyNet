@@ -1,0 +1,73 @@
+# AnonyNet Proxy Server
+# Author: MD. SABBIR HOSHEN HOOWLADER
+# Website: https://sabbir28.github.io/
+# License: MIT License
+# Description: AnonyNet is a proxy server designed to anonymize user requests by routing them through random public proxies. 
+# It aims to enhance privacy and security while browsing by masking the user's IP address and encrypting data.
+
+from flask import Flask, request, Response
+import requests
+import random
+import logging
+from logging.handlers import RotatingFileHandler
+
+app = Flask(__name__)
+
+# List of public proxies (update with your own list)
+proxies = [
+    "http://proxy1.com:8080",
+    "http://proxy2.com:8080",
+    "http://proxy3.com:8080"
+]
+
+# Setup logging
+handler = RotatingFileHandler('logs/access.log', maxBytes=10000, backupCount=1)
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+app.logger.addHandler(handler)
+
+error_handler = RotatingFileHandler('logs/error.log', maxBytes=10000, backupCount=1)
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(formatter)
+app.logger.addHandler(error_handler)
+
+@app.route('/proxy', methods=['GET', 'POST'])
+def proxy():
+    """
+    Forwards requests through a randomly chosen proxy server.
+    
+    This endpoint handles both GET and POST requests. It selects a random proxy from the
+    predefined list and forwards the request to the target server through that proxy.
+    
+    Returns:
+        Response: The response from the target server, including content and headers.
+    """
+    try:
+        # Choose a random proxy from the list
+        selected_proxy = random.choice(proxies)
+        proxies_dict = {
+            "http": selected_proxy,
+            "https": selected_proxy,
+        }
+
+        # Log the request
+        app.logger.info(f"Received {request.method} request for {request.url} using proxy {selected_proxy}")
+
+        # Forward the request to the target server
+        if request.method == 'POST':
+            response = requests.post(request.url, data=request.form, proxies=proxies_dict)
+        else:
+            response = requests.get(request.url, params=request.args, proxies=proxies_dict)
+
+        # Log the response
+        app.logger.info(f"Response status code: {response.status_code}")
+
+        # Return the response from the target server
+        return Response(response.content, status=response.status_code, headers=dict(response.headers))
+    except Exception as e:
+        app.logger.error(f"Error processing request: {e}")
+        return Response("An error occurred while processing your request.", status=500)
+
+if __name__ == '__main__':
+    app.run(debug=True)
