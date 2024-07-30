@@ -3,32 +3,44 @@ import json
 import sqlite3
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import socks
+import socket
 
-# Path to the JSON file
+# Paths to the JSON, SQL, and CSV files
 json_file_path = 'proxies/proxy_list.json'
-
-# Path to the SQL and CSV files
-sql_file_path = 'working_proxies.db'
-csv_file_path = 'working_proxies.csv'
+sql_file_path = 'proxies/db/working_proxies.db'
+csv_file_path = 'proxies/db/working_proxies.csv'
 
 # List to store working proxies
 working_proxies = []
 
-# Test URL
-test_url = "http://www.example.com"
+# Update test URLs for SOCKS proxies
+test_urls = {
+    "http": "http://www.example.com",
+    "https": "https://www.example.com",
+    "socks4": "http://www.example.com",
+    "socks5": "http://www.example.com"
+}
 
 def check_proxy(proxy):
-    proxies_dict = {
-        "http": proxy,
-        "https": proxy,
-    }
+    proxy_type = proxy['Type'].lower()
+    proxy_address = f"{proxy_type}://{proxy['IP Address']}:{proxy['Port']}"
+    
+    # For SOCKS proxies, use the SOCKS library
+    if proxy_type in ["socks4", "socks5"]:
+        socks.set_default_proxy(socks.SOCKS4 if proxy_type == "socks4" else socks.SOCKS5, proxy['IP Address'], int(proxy['Port']))
+        socket.socket = socks.socksocket
+    
+    proxies_dict = {proxy_type: proxy_address}
+    
     try:
-        response = requests.get(test_url, proxies=proxies_dict, timeout=5)
+        response = requests.get(test_urls.get(proxy_type, "http://www.example.com"), proxies=proxies_dict, timeout=5)
         if response.status_code == 200:
-            print(f"Proxy {proxy} is alive")
-            return proxy
+            print(f"Proxy {proxy_address} is alive")
+            return proxy_address
     except requests.RequestException as e:
-        print(f"Proxy {proxy} failed: {e}")
+        print(f"Proxy {proxy_address} failed: {e}")
     return None
 
 def find_working_proxies(proxies):
@@ -66,6 +78,8 @@ def save_to_sql(proxies):
     print(f"Working proxies have been written to {sql_file_path}")
 
 def save_to_csv(proxies):
+    if os.path.dirname(csv_file_path):
+        os.makedirs(os.path.dirname(csv_file_path), exist_ok=True)
     with open(csv_file_path, 'w', newline='') as csvfile:
         csvwriter = csv.writer(csvfile)
         csvwriter.writerow(['Proxy'])
@@ -78,11 +92,8 @@ if __name__ == "__main__":
     with open(json_file_path, 'r') as json_file:
         proxy_list = json.load(json_file)
     
-    # Extract proxy addresses from the JSON data
-    proxies = [f"http://{proxy['IP Address']}:{proxy['Port']}" for proxy in proxy_list]
-
     # Find working proxies
-    find_working_proxies(proxies)
+    find_working_proxies(proxy_list)
     
     # Save working proxies to SQL and CSV files
     save_to_sql(working_proxies)

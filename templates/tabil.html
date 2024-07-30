@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Working Proxies</title>
+</head>
+<body>
+    <h1>Working Proxies</h1>
+    <table border="1">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Proxy</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for proxy in proxies %}
+            <tr>
+                <td>{{ proxy[0] }}</td>
+                <td>{{ proxy[1] }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
