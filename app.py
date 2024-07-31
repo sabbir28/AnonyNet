@@ -16,7 +16,7 @@ app = Flask(__name__)
 
 # List of public proxies (update with your own list)
 proxies = [
-    "http://212.108.155.205:9090"
+    "http://127.0.0.1:8888"
 ]
 
 # Setup logging
@@ -86,9 +86,9 @@ def proxy():
         # Forward the request to the target server
         try:
             if request.method == 'POST':
-                response = requests.post(target_url, data=request.form, proxies=proxies_dict, timeout=10)
+                response = requests.post(target_url, data=request.form, proxies=proxies_dict, timeout=20)
             else:
-                response = requests.get(target_url, params=request.args, proxies=proxies_dict, timeout=10)
+                response = requests.get(target_url, params=request.args, timeout=20)
 
             # Log the response
             app.logger.info(f"Response status code: {response.status_code}")
