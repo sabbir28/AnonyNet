@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Download File</title>
+</head>
+<body>
+    <h1>Download File</h1>
+    {% if success %}
+    <p>File downloaded successfully.</p>
+    <p><strong>File Name:</strong> {{ file_name }}</p>
+    <p><strong>File Type:</strong> {{ file_type }}</p>
+    <p><strong>File Size:</strong> {{ file_size|round(2) }} MB</p>
+    <p><a href="{{ download_link }}">Click here to download the file</a>.</p>
+    {% elif error %}
+    <p>Error: {{ error }}</p>
+    {% endif %}
+    <form method="post">
+        <label for="file_url">File URL:</label>
+        <input type="text" id="file_url" name="file_url" required>
+        <button type="submit">Download</button>
+    </form>
+</body>
+</html>
