@@ -12,17 +12,15 @@
 #include <netdb.h>
 
 #define BUFFER_SIZE 8192
-#define MAX_CONNECTIONS 100
+#define MAX_CONNECTIONS 1000
 #define DEFAULT_HOST "0.0.0.0"
 #define DEFAULT_PORT 8000
 
-int server_socket = -1;
-int shutdown_flag = 0;
-pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
-int *all_connections = NULL;
-int connection_count = 0;
-
-// ========== Colored Logging ==========
+static int server_socket = -1;
+static volatile sig_atomic_t shutdown_flag = 0;
+static pthread_mutex_t connections_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int *all_connections = NULL;
+static int connection_count = 0;
 
 void get_timestamp(char *buffer, size_t size) {
     time_t now = time(NULL);
@@ -30,37 +28,17 @@ void get_timestamp(char *buffer, size_t size) {
     strftime(buffer, size, "%Y-%m-%d %H:%M:%S", tm_info);
 }
 
-void log_info(const char *msg) {
+void log_msg(const char *level_color, const char *level, const char *msg) {
     char timestamp[20];
     get_timestamp(timestamp, sizeof(timestamp));
-    printf("\033[92m[%s] [INFO]\033[0m %s\n", timestamp, msg);
+    printf("%s[%s] [%s]\033[0m %s\n", level_color, timestamp, level, msg);
 }
 
-void log_warn(const char *msg) {
-    char timestamp[20];
-    get_timestamp(timestamp, sizeof(timestamp));
-    printf("\033[93m[%s] [WARN]\033[0m %s\n", timestamp, msg);
-}
-
-void log_error(const char *msg) {
-    char timestamp[20];
-    get_timestamp(timestamp, sizeof(timestamp));
-    printf("\033[91m[%s] [ERROR]\033[0m %s\n", timestamp, msg);
-}
-
-void log_http(const char *msg) {
-    char timestamp[20];
-    get_timestamp(timestamp, sizeof(timestamp));
-    printf("\033[94m[%s] [HTTP]\033[0m %s\n", timestamp, msg);
-}
-
-void log_https(const char *msg) {
-    char timestamp[20];
-    get_timestamp(timestamp, sizeof(timestamp));
-    printf("\033[95m[%s] [HTTPS]\033[0m %s\n", timestamp, msg);
-}
-
-// ========== Forwarder ==========
+#define LOG_INFO(msg) log_msg("\033[92m", "INFO", msg)
+#define LOG_WARN(msg) log_msg("\033[93m", "WARN", msg)
+#define LOG_ERROR(msg) log_msg("\033[91m", "ERROR", msg)
+#define LOG_HTTP(msg) log_msg("\033[94m", "HTTP", msg)
+#define LOG_HTTPS(msg) log_msg("\033[95m", "HTTPS", msg)
 
 void *forward(void *arg) {
     int *sockets = (int *)arg;
@@ -81,11 +59,23 @@ void *forward(void *arg) {
     return NULL;
 }
 
-// ========== Client Handler ==========
+void cleanup_connection(int client_socket) {
+    pthread_mutex_lock(&connections_mutex);
+    for (int i = 0; i < connection_count; i++) {
+        if (all_connections[i] == client_socket) {
+            all_connections[i] = all_connections[--connection_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&connections_mutex);
+    shutdown(client_socket, SHUT_RDWR);
+    close(client_socket);
+}
 
 void *handle_client(void *arg) {
     int client_socket = *(int *)arg;
     free(arg);
+
     struct sockaddr_in client_addr;
     socklen_t addr_len = sizeof(client_addr);
     getpeername(client_socket, (struct sockaddr *)&client_addr, &addr_len);
@@ -93,7 +83,6 @@ void *handle_client(void *arg) {
     inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
     int client_port = ntohs(client_addr.sin_port);
 
-    // Add to connections
     pthread_mutex_lock(&connections_mutex);
     all_connections = realloc(all_connections, (connection_count + 1) * sizeof(int));
     all_connections[connection_count++] = client_socket;
@@ -102,21 +91,20 @@ void *handle_client(void *arg) {
     char buffer[BUFFER_SIZE];
     ssize_t bytes = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
     if (bytes <= 0) {
-        close(client_socket);
+        cleanup_connection(client_socket);
         return NULL;
     }
     buffer[bytes] = '\0';
 
-    // Parse first line
     char *first_line = strtok(buffer, "\n");
     if (!first_line) {
-        close(client_socket);
+        cleanup_connection(client_socket);
         return NULL;
     }
 
     char method[16], path[256], protocol[16];
     if (sscanf(first_line, "%15s %255s %15s", method, path, protocol) != 3) {
-        close(client_socket);
+        cleanup_connection(client_socket);
         return NULL;
     }
 
@@ -124,18 +112,18 @@ void *handle_client(void *arg) {
         char host[256];
         int port;
         if (sscanf(path, "%255[^:]:%d", host, &port) != 2) {
-            close(client_socket);
+            cleanup_connection(client_socket);
             return NULL;
         }
 
-        char log_msg[512];
-        snprintf(log_msg, sizeof(log_msg), "%s:%d -> CONNECT %s:%d", client_ip, client_port, host, port);
-        log_https(log_msg);
+        char log_msg_buf[512];
+        snprintf(log_msg_buf, sizeof(log_msg_buf), "%s:%d -> CONNECT %s:%d", client_ip, client_port, host, port);
+        LOG_HTTPS(log_msg_buf);
 
         struct hostent *he = gethostbyname(host);
         if (!he) {
-            log_error("Failed to resolve host");
-            close(client_socket);
+            LOG_ERROR("Failed to resolve host");
+            cleanup_connection(client_socket);
             return NULL;
         }
 
@@ -146,56 +134,50 @@ void *handle_client(void *arg) {
 
         int remote_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (remote_socket < 0 || connect(remote_socket, (struct sockaddr *)&remote_addr, sizeof(remote_addr)) < 0) {
-            log_error("Failed to connect to remote host");
-            close(client_socket);
+            LOG_ERROR("Failed to connect to remote host");
+            cleanup_connection(client_socket);
             return NULL;
         }
 
         const char *response = "HTTP/1.1 200 Connection Established\r\n\r\n";
         send(client_socket, response, strlen(response), 0);
 
-        int *sockets1 = malloc(2 * sizeof(int));
-        int *sockets2 = malloc(2 * sizeof(int));
-        sockets1[0] = client_socket; sockets1[1] = remote_socket;
-        sockets2[0] = remote_socket; sockets2[1] = client_socket;
+        int *s1 = malloc(2 * sizeof(int));
+        int *s2 = malloc(2 * sizeof(int));
+        s1[0] = client_socket; s1[1] = remote_socket;
+        s2[0] = remote_socket; s2[1] = client_socket;
 
         pthread_t t1, t2;
-        pthread_create(&t1, NULL, forward, sockets1);
-        pthread_create(&t2, NULL, forward, sockets2);
+        pthread_create(&t1, NULL, forward, s1);
+        pthread_create(&t2, NULL, forward, s2);
         pthread_detach(t1);
         pthread_detach(t2);
     } else {
-        // Handle HTTP
         if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
-            char log_msg[512];
-            snprintf(log_msg, sizeof(log_msg), "%s:%d -> health check", client_ip, client_port);
-            log_info(log_msg);
+            char log_msg_buf[256];
+            snprintf(log_msg_buf, sizeof(log_msg_buf), "%s:%d -> health check", client_ip, client_port);
+            LOG_INFO(log_msg_buf);
 
             const char *response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
             send(client_socket, response, strlen(response), 0);
-            close(client_socket);
+            cleanup_connection(client_socket);
             return NULL;
         }
 
         char *host_line = strstr(buffer, "Host:");
         if (!host_line) {
-            char log_msg[512];
-            snprintf(log_msg, sizeof(log_msg), "%s:%d -> No Host header", client_ip, client_port);
-            log_warn(log_msg);
-            close(client_socket);
+            LOG_WARN("No Host header");
+            cleanup_connection(client_socket);
             return NULL;
         }
 
         char host[256];
         sscanf(host_line, "Host: %255s", host);
-        char log_msg[512];
-        snprintf(log_msg, sizeof(log_msg), "%s:%d -> %s http://%s%s", client_ip, client_port, method, host, path);
-        log_http(log_msg);
 
         struct hostent *he = gethostbyname(host);
         if (!he) {
-            log_error("Failed to resolve host");
-            close(client_socket);
+            LOG_ERROR("Failed to resolve host");
+            cleanup_connection(client_socket);
             return NULL;
         }
 
@@ -206,21 +188,21 @@ void *handle_client(void *arg) {
 
         int remote_socket = socket(AF_INET, SOCK_STREAM, 0);
         if (remote_socket < 0 || connect(remote_socket, (struct sockaddr *)&remote_addr, sizeof(remote_addr)) < 0) {
-            log_error("Failed to connect to remote host");
-            close(client_socket);
+            LOG_ERROR("Failed to connect to remote host");
+            cleanup_connection(client_socket);
             return NULL;
         }
 
         send(remote_socket, buffer, bytes, 0);
 
-        int *sockets1 = malloc(2 * sizeof(int));
-        int *sockets2 = malloc(2 * sizeof(int));
-        sockets1[0] = client_socket; sockets1[1] = remote_socket;
-        sockets2[0] = remote_socket; sockets2[1] = client_socket;
+        int *s1 = malloc(2 * sizeof(int));
+        int *s2 = malloc(2 * sizeof(int));
+        s1[0] = client_socket; s1[1] = remote_socket;
+        s2[0] = remote_socket; s2[1] = client_socket;
 
         pthread_t t1, t2;
-        pthread_create(&t1, NULL, forward, sockets1);
-        pthread_create(&t2, NULL, forward, sockets2);
+        pthread_create(&t1, NULL, forward, s1);
+        pthread_create(&t2, NULL, forward, s2);
         pthread_detach(t1);
         pthread_detach(t2);
     }
@@ -228,15 +210,12 @@ void *handle_client(void *arg) {
     return NULL;
 }
 
-// ========== Server ==========
-
-void shutdown_server(int signum) {
-    log_warn("Shutting down server...");
+void shutdown_server(int sig) {
+    (void)sig;
     shutdown_flag = 1;
+    LOG_WARN("Shutting down server...");
 
-    if (server_socket >= 0) {
-        close(server_socket);
-    }
+    if (server_socket >= 0) close(server_socket);
 
     pthread_mutex_lock(&connections_mutex);
     for (int i = 0; i < connection_count; i++) {
@@ -246,43 +225,43 @@ void shutdown_server(int signum) {
         }
     }
     free(all_connections);
+    all_connections = NULL;
     connection_count = 0;
     pthread_mutex_unlock(&connections_mutex);
 
-    log_info("Goodbye 👋");
+    LOG_INFO("Proxy shutdown complete.");
     exit(0);
 }
 
 void start_proxy(const char *host, int port) {
+    struct sockaddr_in server_addr = {0};
+
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
-        log_error("Failed to create server socket");
-        exit(1);
+        perror("socket");
+        exit(EXIT_FAILURE);
     }
 
     int opt = 1;
     setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     inet_pton(AF_INET, host, &server_addr.sin_addr);
 
     if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        log_error("Failed to bind server socket");
-        close(server_socket);
-        exit(1);
+        perror("bind");
+        exit(EXIT_FAILURE);
     }
 
     if (listen(server_socket, MAX_CONNECTIONS) < 0) {
-        log_error("Failed to listen on server socket");
-        close(server_socket);
-        exit(1);
+        perror("listen");
+        exit(EXIT_FAILURE);
     }
 
-    char log_msg[256];
-    snprintf(log_msg, sizeof(log_msg), "Proxy running on %s:%d", host, port);
-    log_info(log_msg);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Proxy server running on %s:%d", host, port);
+    LOG_INFO(msg);
 
     signal(SIGINT, shutdown_server);
     signal(SIGTERM, shutdown_server);
@@ -293,36 +272,40 @@ void start_proxy(const char *host, int port) {
         int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &addr_len);
         if (client_socket < 0) {
             if (shutdown_flag) break;
-            log_error("Failed to accept connection");
+            perror("accept");
             continue;
         }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
-        snprintf(log_msg, sizeof(log_msg), "New connection from %s:%d", client_ip, ntohs(client_addr.sin_port));
-        log_info(log_msg);
+        int *client_ptr = malloc(sizeof(int));
+        if (!client_ptr) {
+            LOG_ERROR("Memory allocation failed");
+            close(client_socket);
+            continue;
+        }
 
-        int *client_sock_ptr = malloc(sizeof(int));
-        *client_sock_ptr = client_socket;
-        pthread_t thread;
-        pthread_create(&thread, NULL, handle_client, client_sock_ptr);
-        pthread_detach(thread);
+        *client_ptr = client_socket;
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_client, client_ptr) != 0) {
+            LOG_ERROR("Thread creation failed");
+            free(client_ptr);
+            close(client_socket);
+            continue;
+        }
+        pthread_detach(tid);
     }
 
     shutdown_server(0);
 }
-
-// ========== CLI ==========
 
 int main(int argc, char *argv[]) {
     const char *host = DEFAULT_HOST;
     int port = DEFAULT_PORT;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--host") == 0) {
-            if (i + 1 < argc) host = argv[++i];
-        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) {
-            if (i + 1 < argc) port = atoi(argv[++i]);
+        if ((strcmp(argv[i], "-H") == 0 || strcmp(argv[i], "--host") == 0) && i + 1 < argc) {
+            host = argv[++i];
+        } else if ((strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) && i + 1 < argc) {
+            port = atoi(argv[++i]);
         }
     }
 
