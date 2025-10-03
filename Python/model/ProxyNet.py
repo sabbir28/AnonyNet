@@ -3,10 +3,13 @@ import socket
 import time
 import requests
 from bs4 import BeautifulSoup
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from urllib.parse import urlparse
 from pathlib import Path
 import os
+from datetime import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import socks  # PySocks
@@ -108,14 +111,15 @@ class ProxyManager:
                 latest_update = columns[6].text.strip()
 
                 proxy_data = {
-                    "IP Address": ip_address,
-                    "Port": port,
-                    "Country": country,
-                    "City": city,
-                    "Speed": speed,
-                    "Type": proxy_type,
-                    "Anonymity": anonymity,
-                    "Latest Update": latest_update
+                    "ip_address": ip_address,
+                    "port": port,
+                    "country": country,
+                    "city": city,
+                    "speed": speed,
+                    "type": proxy_type,
+                    "anonymity": anonymity,
+                    "latest_update": latest_update,
+                    "scraped_at": datetime.now().isoformat()
                 }
                 proxies.append(proxy_data)
         
@@ -287,8 +291,8 @@ class ProxyManager:
         if target_url is None:
             target_url = self.target_url
             
-        ip = proxy.get("IP Address", "")
-        port_str = proxy.get("Port", "0")
+        ip = proxy.get("ip_address", "")
+        port_str = proxy.get("port", "0")
         
         try:
             port = int(port_str)
@@ -297,12 +301,10 @@ class ProxyManager:
                 "success": False,
                 "message": f"Invalid port: {port_str}",
                 "response_time": 0.0,
-                "headers": "",
-                "body": "",
                 "ip_api": None,
             }
             
-        ptype = (proxy.get("Type") or "HTTP").upper()
+        ptype = (proxy.get("type") or "HTTP").upper()
 
         parsed = urlparse(target_url)
         host = parsed.hostname or ""
@@ -327,11 +329,10 @@ class ProxyManager:
             elapsed = time.time() - start
 
             parsed_resp = self._parse_http_response(raw)
-            headers = parsed_resp["headers"]
             body = parsed_resp["body"]
 
-            success = headers.splitlines()[0].upper().find("200 OK") != -1
-            message = "Success" if success else f"Bad status: {headers.splitlines()[0] if headers else 'no headers'}"
+            success = parsed_resp["headers"].splitlines()[0].upper().find("200 OK") != -1
+            message = "Success" if success else f"Bad status: {parsed_resp['headers'].splitlines()[0] if parsed_resp['headers'] else 'no headers'}"
 
             ip_api = self._extract_ip_api(body) if body else None
 
@@ -339,8 +340,6 @@ class ProxyManager:
                 "success": success,
                 "message": message,
                 "response_time": round(elapsed, 3),
-                "headers": headers,
-                "body": body,
                 "ip_api": ip_api,
             }
 
@@ -350,18 +349,78 @@ class ProxyManager:
                 "success": False,
                 "message": str(exc),
                 "response_time": round(elapsed, 3),
-                "headers": "",
-                "body": "",
                 "ip_api": None,
             }
 
-    def test_all_proxies(self, target_url: Optional[str] = None, max_proxies: Optional[int] = None) -> List[Dict[str, Any]]:
+    def test_proxy_batch(self, proxies: List[Dict[str, Any]], target_url: Optional[str] = None, max_workers: int = 10) -> List[Dict[str, Any]]:
+        """
+        Test multiple proxies concurrently.
+        
+        Args:
+            proxies: List of proxies to test
+            target_url: URL to test against
+            max_workers: Maximum number of concurrent threads
+            
+        Returns:
+            List of working proxies
+        """
+        working_proxies = []
+        
+        def test_single_proxy(proxy):
+            result = self.test_proxy(proxy, target_url)
+            if result["success"]:
+                record = proxy.copy()
+                record.update({
+                    "response_time": result["response_time"],
+                    "tested_at": datetime.now().isoformat(),
+                })
+                
+                if result.get("ip_api"):
+                    record["ip_api"] = result["ip_api"]
+                    # Update location info from ip_api
+                    record.update({
+                        "country": result["ip_api"].get("country"),
+                        "country_code": result["ip_api"].get("countryCode"),
+                        "region": result["ip_api"].get("region"),
+                        "region_name": result["ip_api"].get("regionName"),
+                        "city": result["ip_api"].get("city"),
+                        "zip": result["ip_api"].get("zip"),
+                        "lat": result["ip_api"].get("lat"),
+                        "lon": result["ip_api"].get("lon"),
+                        "timezone": result["ip_api"].get("timezone"),
+                        "isp": result["ip_api"].get("isp"),
+                        "org": result["ip_api"].get("org"),
+                        "asn": result["ip_api"].get("as"),
+                        "query_ip": result["ip_api"].get("query"),
+                    })
+                return record
+            return None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_proxy = {executor.submit(test_single_proxy, proxy): proxy for proxy in proxies}
+            
+            for future in as_completed(future_to_proxy):
+                proxy = future_to_proxy[future]
+                try:
+                    result = future.result()
+                    if result:
+                        working_proxies.append(result)
+                        print(f"✅ Working: {result['ip_address']}:{result['port']} ({result.get('type', 'Unknown')}) - {result['response_time']}s")
+                    else:
+                        print(f"❌ Failed: {proxy['ip_address']}:{proxy['port']}")
+                except Exception as exc:
+                    print(f"❌ Error testing {proxy['ip_address']}:{proxy['port']}: {exc}")
+
+        return working_proxies
+
+    def test_all_proxies(self, target_url: Optional[str] = None, max_proxies: Optional[int] = None, max_workers: int = 10) -> List[Dict[str, Any]]:
         """
         Test all loaded proxies.
         
         Args:
             target_url: URL to test against
             max_proxies: Maximum number of proxies to test
+            max_workers: Maximum number of concurrent threads
             
         Returns:
             List of working proxies
@@ -375,52 +434,89 @@ class ProxyManager:
         if max_proxies:
             proxies = proxies[:max_proxies]
             
-        working = []
-        total = len(proxies)
+        print(f"🧪 Testing {len(proxies)} proxies with {max_workers} concurrent workers...")
         
-        print(f"🧪 Testing {total} proxies...")
+        working_proxies = self.test_proxy_batch(proxies, target_url, max_workers)
         
-        for i, proxy in enumerate(proxies, 1):
-            ip = proxy.get("IP Address")
-            port = proxy.get("Port")
-            ptype = proxy.get("Type")
-            print(f"[{i}/{total}] Testing {ip}:{port} ({ptype})... ", end="", flush=True)
+        self.save_proxies_to_json(working_proxies, self.working_file)
+        print(f"✅ Saved {len(working_proxies)} working proxies to {self.working_file}")
+        return working_proxies
 
-            result = self.test_proxy(proxy, target_url)
-            if result["success"]:
-                print("✅ Working")
-                record = proxy.copy()
-                record.update({
-                    "response_time": result["response_time"],
-                    "probe_message": result["message"],
-                    "headers": result["headers"],
-                    "body_preview": result["body"][:200],
-                })
-                
-                if result.get("ip_api"):
-                    record["ip_api"] = result["ip_api"]
-                    record.update({
-                        "country": result["ip_api"].get("country"),
-                        "countryCode": result["ip_api"].get("countryCode"),
-                        "region": result["ip_api"].get("region"),
-                        "regionName": result["ip_api"].get("regionName"),
-                        "city": result["ip_api"].get("city"),
-                        "zip": result["ip_api"].get("zip"),
-                        "lat": result["ip_api"].get("lat"),
-                        "lon": result["ip_api"].get("lon"),
-                        "timezone": result["ip_api"].get("timezone"),
-                        "isp": result["ip_api"].get("isp"),
-                        "org": result["ip_api"].get("org"),
-                        "asn": result["ip_api"].get("as"),
-                        "query": result["ip_api"].get("query"),
-                    })
-                working.append(record)
-            else:
-                print(f"❌ Failed ({result['message']})")
+    def test_untested_proxies(self, target_url: Optional[str] = None, max_workers: int = 10) -> List[Dict[str, Any]]:
+        """
+        Test proxies that are in proxy list but not in working list.
+        
+        Args:
+            target_url: URL to test against
+            max_workers: Maximum number of concurrent threads
+            
+        Returns:
+            List of newly discovered working proxies
+        """
+        if not self.proxy_file.exists():
+            print("❌ No proxy file found. Please scrape proxies first.")
+            return []
 
-        self.save_proxies_to_json(working, self.working_file)
-        print(f"✅ Saved {len(working)} working proxies to {self.working_file}")
-        return working
+        all_proxies = self.load_proxies_from_json(self.proxy_file)
+        working_proxies = self.load_proxies_from_json(self.working_file)
+        
+        # Get IP:Port combinations of working proxies
+        working_set = {f"{p['ip_address']}:{p['port']}" for p in working_proxies}
+        
+        # Find untested proxies
+        untested_proxies = [
+            p for p in all_proxies 
+            if f"{p['ip_address']}:{p['port']}" not in working_set
+        ]
+        
+        if not untested_proxies:
+            print("✅ All proxies have been tested")
+            return []
+            
+        print(f"🧪 Testing {len(untested_proxies)} untested proxies...")
+        
+        new_working_proxies = self.test_proxy_batch(untested_proxies, target_url, max_workers)
+        
+        if new_working_proxies:
+            # Combine with existing working proxies
+            all_working = working_proxies + new_working_proxies
+            self.save_proxies_to_json(all_working, self.working_file)
+            print(f"✅ Added {len(new_working_proxies)} new working proxies. Total: {len(all_working)}")
+        
+        return new_working_proxies
+
+    def validate_working_proxies(self, target_url: Optional[str] = None, max_workers: int = 10) -> List[Dict[str, Any]]:
+        """
+        Re-test all working proxies and remove non-working ones.
+        
+        Args:
+            target_url: URL to test against
+            max_workers: Maximum number of concurrent threads
+            
+        Returns:
+            List of still working proxies
+        """
+        if not self.working_file.exists():
+            print("❌ No working proxies file found")
+            return []
+
+        working_proxies = self.load_proxies_from_json(self.working_file)
+        
+        if not working_proxies:
+            print("❌ No working proxies to validate")
+            return []
+            
+        print(f"🔍 Validating {len(working_proxies)} working proxies...")
+        
+        still_working = self.test_proxy_batch(working_proxies, target_url, max_workers)
+        
+        # Save updated list
+        self.save_proxies_to_json(still_working, self.working_file)
+        
+        removed_count = len(working_proxies) - len(still_working)
+        print(f"✅ Validation complete. Removed {removed_count} non-working proxies. {len(still_working)} proxies remain.")
+        
+        return still_working
 
     def scrape_and_save_proxies(self, url: str = "https://hide.mn/en/proxy-list/") -> bool:
         """
@@ -441,6 +537,43 @@ class ProxyManager:
             return False
             
         return self.save_proxies_to_json(proxies)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about proxies.
+        
+        Returns:
+            Dictionary with proxy statistics
+        """
+        all_proxies = self.load_proxies_from_json(self.proxy_file) if self.proxy_file.exists() else []
+        working_proxies = self.load_proxies_from_json(self.working_file) if self.working_file.exists() else []
+        
+        stats = {
+            "total_proxies": len(all_proxies),
+            "working_proxies": len(working_proxies),
+            "success_rate": round(len(working_proxies) / len(all_proxies) * 100, 2) if all_proxies else 0,
+        }
+        
+        # Count by type
+        type_counts = {}
+        for proxy in working_proxies:
+            ptype = proxy.get("type", "Unknown")
+            type_counts[ptype] = type_counts.get(ptype, 0) + 1
+        stats["by_type"] = type_counts
+        
+        # Count by country
+        country_counts = {}
+        for proxy in working_proxies:
+            country = proxy.get("country", "Unknown")
+            country_counts[country] = country_counts.get(country, 0) + 1
+        stats["by_country"] = country_counts
+        
+        # Average response time
+        if working_proxies:
+            avg_time = sum(p.get("response_time", 0) for p in working_proxies) / len(working_proxies)
+            stats["avg_response_time"] = round(avg_time, 3)
+        
+        return stats
 
     def get_working_proxies(self) -> List[Dict[str, Any]]:
         """
@@ -476,7 +609,7 @@ class ProxyManager:
             List of proxies from specified country
         """
         working = self.get_working_proxies()
-        return [p for p in working if p.get("countryCode") == country_code.upper()]
+        return [p for p in working if p.get("country_code") == country_code.upper()]
 
     def get_proxies_by_type(self, proxy_type: str) -> List[Dict[str, Any]]:
         """
@@ -489,43 +622,83 @@ class ProxyManager:
             List of proxies of specified type
         """
         working = self.get_working_proxies()
-        return [p for p in working if p.get("Type", "").upper() == proxy_type.upper()]
+        return [p for p in working if p.get("type", "").upper() == proxy_type.upper()]
+
+    def clear_working_proxies(self) -> bool:
+        """
+        Clear all working proxies.
+        
+        Returns:
+            bool: True if successful
+        """
+        try:
+            if self.working_file.exists():
+                self.working_file.unlink()
+            print("✅ Working proxies cleared")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to clear working proxies: {e}")
+            return False
 
 
 def main():
-    """Example usage of the ProxyManager class."""
+    """Example usage of the enhanced ProxyManager class."""
     
     # Initialize proxy manager
     pm = ProxyManager()
     
+    # Display initial stats
+    print("📊 Initial Proxy Statistics:")
+    stats = pm.get_stats()
+    print(f"   Total proxies in list: {stats['total_proxies']}")
+    print(f"   Working proxies: {stats['working_proxies']}")
+    print(f"   Success rate: {stats['success_rate']}%")
+    
     # Scrape and save proxies
-    print("🔍 Scraping proxies...")
+    print("\n🔍 Scraping new proxies...")
     if pm.scrape_and_save_proxies():
         print("✅ Proxy scraping completed")
     else:
         print("❌ Proxy scraping failed")
         return
     
-    # Test all proxies
-    print("\n🧪 Testing proxies...")
-    working_proxies = pm.test_all_proxies(max_proxies=50)  # Test first 50 proxies
+    # Test all proxies with concurrent testing
+    print("\n🧪 Testing all proxies concurrently...")
+    working_proxies = pm.test_all_proxies(max_proxies=100, max_workers=20)
     
-    # Display results
-    print(f"\n📊 Results:")
-    print(f"Total working proxies: {len(working_proxies)}")
+    # Test untested proxies
+    print("\n🔍 Testing untested proxies...")
+    new_proxies = pm.test_untested_proxies(max_workers=15)
     
-    if working_proxies:
+    # Validate working proxies
+    print("\n🔍 Validating working proxies...")
+    valid_proxies = pm.validate_working_proxies(max_workers=15)
+    
+    # Display final results
+    print(f"\n📊 Final Results:")
+    stats = pm.get_stats()
+    print(f"   Total proxies in list: {stats['total_proxies']}")
+    print(f"   Working proxies: {stats['working_proxies']}")
+    print(f"   Success rate: {stats['success_rate']}%")
+    print(f"   Average response time: {stats.get('avg_response_time', 'N/A')}s")
+    
+    if stats['working_proxies'] > 0:
         # Show fastest proxies
         fastest = pm.get_fastest_proxies(5)
         print(f"\n🚀 Top 5 fastest proxies:")
         for i, proxy in enumerate(fastest, 1):
-            print(f"{i}. {proxy['IP Address']}:{proxy['Port']} - {proxy['response_time']}s - {proxy.get('country', 'Unknown')}")
+            print(f"   {i}. {proxy['ip_address']}:{proxy['port']} - {proxy['response_time']}s - {proxy.get('country', 'Unknown')}")
         
         # Show proxies by type
-        for ptype in ['HTTP', 'SOCKS4', 'SOCKS5']:
-            typed_proxies = pm.get_proxies_by_type(ptype)
-            if typed_proxies:
-                print(f"\n🔧 {ptype} proxies: {len(typed_proxies)}")
+        print(f"\n🔧 Proxies by type:")
+        for ptype, count in stats['by_type'].items():
+            print(f"   {ptype}: {count}")
+        
+        # Show top countries
+        print(f"\n🌍 Top countries:")
+        sorted_countries = sorted(stats['by_country'].items(), key=lambda x: x[1], reverse=True)[:5]
+        for country, count in sorted_countries:
+            print(f"   {country}: {count}")
 
 
 if __name__ == "__main__":

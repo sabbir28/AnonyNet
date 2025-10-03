@@ -1,8 +1,13 @@
 from model.ProxyNet import ProxyManager
+from model.AnonyNetProxyServer import AnonyNetProxyServer
 
 if __name__ == "__main__":
     # Quick start
     pm = ProxyManager()
-    pm.scrape_and_save_proxies()
-    working = pm.test_all_proxies(max_proxies=20)
-    fastest = pm.get_fastest_proxies(5)
+    working = pm.test_all_proxies(max_workers=64)
+    fastest = pm.get_fastest_proxies(1)
+    
+    # Start proxy server
+    proxy = AnonyNetProxyServer()
+    proxy.start()
+
